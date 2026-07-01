@@ -11,9 +11,10 @@ FastAPI backend that:
 import os
 import re
 import time
+import asyncio
 import logging
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional
 
 import httpx
 import firebase_admin
@@ -28,17 +29,17 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("whatsapp-service")
 
-# ── WAHA Configuration ─────────────────────────────────────────────────
-WAHA_URL      = os.getenv("WAHA_URL", "http://localhost:3000")
-WAHA_API_KEY  = os.getenv("WAHA_API_KEY", "")
-WAHA_SESSION  = os.getenv("WAHA_SESSION", "default")
+# ---------- WAHA Configuration ----------
+WAHA_URL             = os.getenv("WAHA_URL", "http://localhost:3000")
+WAHA_API_KEY         = os.getenv("WAHA_API_KEY", "")
+WAHA_SESSION         = os.getenv("WAHA_SESSION", "default")
 DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "91")
 
-# ── Rate limiting ──────────────────────────────────────────────────────
+# ---------- Rate limiting ----------
 MIN_SECONDS_BETWEEN_SENDS = 2
 _last_send_time = 0.0
 
-# ── Firebase Initialization ────────────────────────────────────────────
+# ---------- Firebase Initialization ----------
 firebase_cert = {
     "type":                        os.getenv("FIREBASE_TYPE"),
     "project_id":                  os.getenv("FIREBASE_PROJECT_ID"),
@@ -61,10 +62,9 @@ except Exception as e:
     logger.error(f"Firebase initialization failed: {e}")
     raise
 
-# Firestore collection name
 LOGS_COLLECTION = "message_logs"
 
-# ── FastAPI App ────────────────────────────────────────────────────────
+# ---------- FastAPI App ----------
 app = FastAPI(title="WhatsApp Messaging Service API")
 
 app.add_middleware(
@@ -73,8 +73,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:3001",
         "http://localhost:3002",
-        # Add your Vercel URL here after deploying:
-        # "https://your-app.vercel.app",
+        "https://waha-messaging-frontend.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -82,18 +81,16 @@ app.add_middleware(
 )
 
 
-# ── Firestore Log Helpers ──────────────────────────────────────────────
+# ---------- Firestore Helpers ----------
 def write_log_to_firestore(entry: dict):
-    """Saves a message log entry to Firestore."""
     try:
         db.collection(LOGS_COLLECTION).add(entry)
-        logger.info(f"Log saved to Firestore: {entry['receiver_id']} - {entry['status']}")
+        logger.info(f"Log saved: {entry['receiver_id']} - {entry['status']}")
     except Exception as e:
-        logger.error(f"Failed to write log to Firestore: {e}")
+        logger.error(f"Failed to write log: {e}")
 
 
 def read_logs_from_firestore(limit: int = 100) -> list:
-    """Reads the most recent message logs from Firestore, newest first."""
     try:
         docs = (
             db.collection(LOGS_COLLECTION)
@@ -103,27 +100,22 @@ def read_logs_from_firestore(limit: int = 100) -> list:
         )
         return [{"id": doc.id, **doc.to_dict()} for doc in docs]
     except Exception as e:
-        logger.error(f"Failed to read logs from Firestore: {e}")
+        logger.error(f"Failed to read logs: {e}")
         return []
 
 
 def clear_logs_from_firestore():
-    """Deletes all documents in the message_logs collection."""
     try:
         docs = db.collection(LOGS_COLLECTION).stream()
         for doc in docs:
             doc.reference.delete()
-        logger.info("All logs cleared from Firestore")
+        logger.info("All logs cleared")
     except Exception as e:
-        logger.error(f"Failed to clear logs from Firestore: {e}")
+        logger.error(f"Failed to clear logs: {e}")
 
 
-# ── Validation Helpers ─────────────────────────────────────────────────
+# ---------- Validation Helpers ----------
 def normalize_phone_to_chat_id(phone: str, country_code: str) -> str:
-    """
-    Converts a raw phone number into WAHA individual chat ID format.
-    Example: 9876543210 + country 91 -> 919876543210@c.us
-    """
     digits_only = re.sub(r"\D", "", phone)
     if digits_only.startswith(country_code):
         full_number = digits_only
@@ -133,10 +125,6 @@ def normalize_phone_to_chat_id(phone: str, country_code: str) -> str:
 
 
 def validate_group_id(group_id: str) -> str:
-    """
-    Validates and normalizes a WhatsApp group ID.
-    Accepts full format (120363426488518199@g.us) or just the numeric part.
-    """
     group_id = group_id.strip()
     if group_id.endswith("@g.us"):
         return group_id
@@ -145,7 +133,7 @@ def validate_group_id(group_id: str) -> str:
     raise ValueError("Invalid WhatsApp group ID format. Use numeric-id@g.us")
 
 
-# ── Pydantic Request Models ────────────────────────────────────────────
+# ---------- Pydantic Models ----------
 class IndividualMessageRequest(BaseModel):
     phone_number: str
     message: str
@@ -190,23 +178,27 @@ class GroupMessageRequest(BaseModel):
         return v
 
 
-# ── Rate Limit Check ───────────────────────────────────────────────────
+class ScheduledMessageRequest(BaseModel):
+    receiver_type: str   # "individual" or "group"
+    receiver_id: str     # phone number or group_id
+    message: str
+    scheduled_time: str  # ISO format: "2026-07-01T15:30:00"
+    country_code: Optional[str] = None
+
+
+# ---------- Rate Limit ----------
 def check_rate_limit():
     global _last_send_time
     now = time.time()
     elapsed = now - _last_send_time
     if elapsed < MIN_SECONDS_BETWEEN_SENDS:
         wait = round(MIN_SECONDS_BETWEEN_SENDS - elapsed, 1)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Sending too fast. Please wait {wait} more seconds.",
-        )
+        raise HTTPException(status_code=429, detail=f"Sending too fast. Please wait {wait} more seconds.")
     _last_send_time = now
 
 
-# ── WAHA Communication ─────────────────────────────────────────────────
+# ---------- WAHA Communication ----------
 async def send_via_waha(chat_id: str, text: str) -> dict:
-    """Posts a sendText request to the WAHA API."""
     url = f"{WAHA_URL}/api/sendText"
     headers = {"Content-Type": "application/json"}
     if WAHA_API_KEY:
@@ -225,7 +217,7 @@ async def send_via_waha(chat_id: str, text: str) -> dict:
         return response.json()
 
 
-# ── API Routes ─────────────────────────────────────────────────────────
+# ---------- Routes ----------
 @app.get("/")
 def root():
     return {"status": "ok", "service": "WhatsApp Messaging Service API"}
@@ -233,7 +225,6 @@ def root():
 
 @app.get("/api/session-status")
 async def session_status():
-    """Check if the WAHA WhatsApp session is connected."""
     url = f"{WAHA_URL}/api/sessions/{WAHA_SESSION}"
     headers = {}
     if WAHA_API_KEY:
@@ -255,9 +246,7 @@ async def session_status():
 
 @app.post("/api/send/individual")
 async def send_individual_message(payload: IndividualMessageRequest):
-    """Send a WhatsApp text message to an individual phone number."""
     check_rate_limit()
-
     country_code = payload.country_code or DEFAULT_COUNTRY_CODE
     chat_id = normalize_phone_to_chat_id(payload.phone_number, country_code)
 
@@ -268,6 +257,7 @@ async def send_individual_message(payload: IndividualMessageRequest):
         "message": payload.message,
         "status": "failed",
         "error": None,
+        "scheduled": False,
     }
 
     try:
@@ -280,13 +270,11 @@ async def send_individual_message(payload: IndividualMessageRequest):
         error_message = str(e)
         log_entry["error"] = error_message
         write_log_to_firestore(log_entry)
-        logger.error(f"Failed to send to {chat_id}: {error_message}")
         raise HTTPException(status_code=502, detail=f"Failed to send message: {error_message}")
 
 
 @app.post("/api/send/group")
 async def send_group_message(payload: GroupMessageRequest):
-    """Send a WhatsApp text message to a WhatsApp group."""
     check_rate_limit()
 
     try:
@@ -301,6 +289,7 @@ async def send_group_message(payload: GroupMessageRequest):
         "message": payload.message,
         "status": "failed",
         "error": None,
+        "scheduled": False,
     }
 
     try:
@@ -313,20 +302,71 @@ async def send_group_message(payload: GroupMessageRequest):
         error_message = str(e)
         log_entry["error"] = error_message
         write_log_to_firestore(log_entry)
-        logger.error(f"Failed to send to group {group_chat_id}: {error_message}")
         raise HTTPException(status_code=502, detail=f"Failed to send message: {error_message}")
+
+
+@app.post("/api/send/scheduled")
+async def schedule_message(payload: ScheduledMessageRequest):
+    """Schedule a WhatsApp message to be sent at a specific time."""
+    try:
+        scheduled_dt = datetime.fromisoformat(payload.scheduled_time)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scheduled_time format. Use: 2026-07-01T15:30:00")
+
+    delay = (scheduled_dt - datetime.now()).total_seconds()
+    if delay < 0:
+        raise HTTPException(status_code=400, detail="Scheduled time must be in the future.")
+
+    if payload.receiver_type == "individual":
+        country_code = payload.country_code or DEFAULT_COUNTRY_CODE
+        chat_id = normalize_phone_to_chat_id(payload.receiver_id, country_code)
+    elif payload.receiver_type == "group":
+        try:
+            chat_id = validate_group_id(payload.receiver_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        raise HTTPException(status_code=400, detail="receiver_type must be 'individual' or 'group'")
+
+    async def send_later():
+        await asyncio.sleep(delay)
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "receiver_type": payload.receiver_type,
+            "receiver_id": chat_id,
+            "message": payload.message,
+            "status": "failed",
+            "error": None,
+            "scheduled": True,
+            "scheduled_time": payload.scheduled_time,
+        }
+        try:
+            await send_via_waha(chat_id, payload.message)
+            log_entry["status"] = "success"
+            logger.info(f"Scheduled message sent to {chat_id}")
+        except Exception as e:
+            log_entry["error"] = str(e)
+            logger.error(f"Scheduled message failed to {chat_id}: {e}")
+        finally:
+            write_log_to_firestore(log_entry)
+
+    asyncio.create_task(send_later())
+    return {
+        "success": True,
+        "message": f"Message scheduled for {payload.scheduled_time}",
+        "chat_id": chat_id,
+        "delay_seconds": round(delay),
+    }
 
 
 @app.get("/api/logs")
 def get_logs(limit: int = 100):
-    """Fetch the most recent message logs from Firestore."""
     logs = read_logs_from_firestore(limit)
     return {"count": len(logs), "logs": logs}
 
 
 @app.delete("/api/logs")
 def clear_logs():
-    """Delete all message logs from Firestore."""
     clear_logs_from_firestore()
     return {"success": True, "message": "All logs cleared from Firestore"}
 
