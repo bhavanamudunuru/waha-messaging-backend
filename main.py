@@ -14,6 +14,7 @@ import time
 import asyncio
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import httpx
@@ -28,6 +29,9 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("whatsapp-service")
+
+# ---------- Timezone ----------
+IST = ZoneInfo("Asia/Kolkata")
 
 # ---------- WAHA Configuration ----------
 WAHA_URL             = os.getenv("WAHA_URL", "http://localhost:3000")
@@ -182,7 +186,7 @@ class ScheduledMessageRequest(BaseModel):
     receiver_type: str   # "individual" or "group"
     receiver_id: str     # phone number or group_id
     message: str
-    scheduled_time: str  # ISO format: "2026-07-01T15:30:00"
+    scheduled_time: str  # ISO format, IST local time: "2026-07-01T15:30:00"
     country_code: Optional[str] = None
 
 
@@ -251,7 +255,7 @@ async def send_individual_message(payload: IndividualMessageRequest):
     chat_id = normalize_phone_to_chat_id(payload.phone_number, country_code)
 
     log_entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(IST).isoformat(),
         "receiver_type": "individual",
         "receiver_id": chat_id,
         "message": payload.message,
@@ -283,7 +287,7 @@ async def send_group_message(payload: GroupMessageRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     log_entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(IST).isoformat(),
         "receiver_type": "group",
         "receiver_id": group_chat_id,
         "message": payload.message,
@@ -307,13 +311,13 @@ async def send_group_message(payload: GroupMessageRequest):
 
 @app.post("/api/send/scheduled")
 async def schedule_message(payload: ScheduledMessageRequest):
-    """Schedule a WhatsApp message to be sent at a specific time."""
+    """Schedule a WhatsApp message to be sent at a specific time (IST)."""
     try:
-        scheduled_dt = datetime.fromisoformat(payload.scheduled_time)
+        scheduled_dt = datetime.fromisoformat(payload.scheduled_time).replace(tzinfo=IST)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid scheduled_time format. Use: 2026-07-01T15:30:00")
 
-    delay = (scheduled_dt - datetime.now()).total_seconds()
+    delay = (scheduled_dt - datetime.now(IST)).total_seconds()
     if delay < 0:
         raise HTTPException(status_code=400, detail="Scheduled time must be in the future.")
 
@@ -331,7 +335,7 @@ async def schedule_message(payload: ScheduledMessageRequest):
     async def send_later():
         await asyncio.sleep(delay)
         log_entry = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(IST).isoformat(),
             "receiver_type": payload.receiver_type,
             "receiver_id": chat_id,
             "message": payload.message,
