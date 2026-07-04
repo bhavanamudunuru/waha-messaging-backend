@@ -10,7 +10,7 @@ from app.core.logging import logger
 
 
 def _waha_headers(include_content_type: bool = True) -> dict:
-    headers = {}
+    headers = {"ngrok-skip-browser-warning": "true"}
     if include_content_type:
         headers["Content-Type"] = "application/json"
     if WAHA_API_KEY:
