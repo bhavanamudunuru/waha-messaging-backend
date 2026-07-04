@@ -41,6 +41,5 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:3002",
-    # Add your Vercel URL here after deploying:
-    # "https://your-app.vercel.app",
+    "https://waha-messaging-frontend.vercel.app",
 ]
